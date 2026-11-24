@@ -217,7 +217,14 @@ class VKMusicProvider(MusicProvider):
     async def _request_data(self, request) -> dict:
         """Execute a prepared VK API request and return its raw data dict."""
         self._service.fill_user_agent_and_token(request)
+        self.logger.debug(
+            "VK call %s %s entering", request.method, request.url
+        )
+        _t0 = time.time()
         response = await make_request_async(request)
+        self.logger.debug(
+            "VK call %s %s done in %.2fs", request.method, request.url, time.time() - _t0
+        )
         data = response.data
         return data if isinstance(data, dict) else {}
 
@@ -496,6 +503,7 @@ class VKMusicProvider(MusicProvider):
 
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
         """Fetch one page of a VK playlist."""
+        self.logger.debug("get_playlist_tracks %s page=%s entering", prov_playlist_id, page)
         if prov_playlist_id.startswith("book:"):
             # audiobook: chapters arrive whole (page 0 only)
             if page:
@@ -504,6 +512,8 @@ class VKMusicProvider(MusicProvider):
             return self._render_book_chapters(book)
         if prov_playlist_id.startswith("podcast:"):
             # podcast episodes via the app's podcasts.getEpisodes
+            if page:
+                return []
             return await self._browse_podcast_episodes(
                 prov_playlist_id.removeprefix("podcast:")
             )

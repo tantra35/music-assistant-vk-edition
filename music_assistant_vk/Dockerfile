@@ -1,4 +1,4 @@
-FROM ghcr.io/music-assistant/server:2.10.9
+FROM ghcr.io/music-assistant/server:2.10.13
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 LABEL org.opencontainers.image.source="https://github.com/maxidrom2008/music-assistant-vk-edition"
 RUN uv pip install --python /app/venv/bin/python --no-cache-dir 'curl-cffi>=0.15.0' 'cryptography>=42.0.0' 'aiofiles>=25.1.0' \
