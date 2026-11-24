@@ -1,0 +1,18 @@
+services:
+  music-assistant:
+    image: tantra35/music-assistant-vk-edition:2.10.13-test
+
+    build:
+      context: .                          # корень репо: Dockerfile ждёт provider/vk_music
+      dockerfile: ./music_assistant_vk/Dockerfile
+
+    restart: unless-stopped
+
+    environment:
+      - LOG_LEVEL=debug
+
+    network_mode: host          # обязательно: mDNS/UPnP-объявление DLNA-рендереров
+
+    volumes:
+      - ./data:/data   # тут MA хранит все свои данные
+      # - /путь/к/вашей/музыке:/media:ro   # опционально, если нужны локальные файлы
