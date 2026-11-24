@@ -99,7 +99,7 @@ class VKMusicProvider(MusicProvider):
         self._podcast_cache: dict[str, dict] = {}
         # podcast episode item_id -> (fresh signed stream url, fetched_at)
         # (audio.getById does not serve podcast episodes on this surface)
-        self._episode_cache: dict[str, tuple[str, float]] = {}
+        self._episode_cache: dict[str, tuple[str, float, str]] = {}
         # chapter item_id -> (stream url, duration, title, fetched_at);
         # urls are signed and expire, so get_stream_details refreshes stale
         # entries before playback
@@ -398,13 +398,21 @@ class VKMusicProvider(MusicProvider):
                 provider_mappings=self._mapping(prov_track_id),
             )
         cached_episode = self._episode_cache.get(prov_track_id)
+        if cached_episode is None:
+            # a queue persisted before a provider restart: rebuild the episode
+            # cache from podcasts.getEpisodes
+            owner_id = prov_track_id.partition("_")[0]
+            if owner_id.startswith("-"):
+                await self._browse_podcast_episodes(owner_id)
+                cached_episode = self._episode_cache.get(prov_track_id)
         if cached_episode is not None:
             # podcast episode: audio.getById does not serve episodes on this
             # token surface — rebuild metadata from the cached stream url
+            url, _ts, ep_title = cached_episode
             return Track(
                 item_id=prov_track_id,
                 provider=self.instance_id,
-                name=prov_track_id,
+                name=ep_title or prov_track_id,
                 duration=0,
                 provider_mappings=self._mapping(prov_track_id),
             )
@@ -700,6 +708,7 @@ class VKMusicProvider(MusicProvider):
                 self._episode_cache[f"{raw['owner_id']}_{raw['id']}"] = (
                     str(raw["url"]),
                     time.time(),
+                    self._clean_title(raw.get("title")),
                 )
         return self._parse_raw_audios(raw_items)
 
