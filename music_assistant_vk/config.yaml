@@ -32,7 +32,7 @@ backup_exclude:
   - .cache/*
   - library.db.backup
 stage: experimental
-image: ghcr.io/maxidrom2008/music-assistant-vk-edition
+image: ghcr.io/tantra35/music-assistant-vk-edition
 tmpfs: true
 options:
   log_level: info
