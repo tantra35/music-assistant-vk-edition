@@ -5,7 +5,7 @@
   "name": "VK Music",
   "description": "Search and stream VK Music using interactive VK login and verification.",
   "codeowners": ["@maxidrom2008"],
-  "requirements": ["vkpymusic==4.0.2"],
+  "requirements": ["curl-cffi>=0.15.0", "cryptography>=42.0.0", "aiofiles>=25.1.0"],
   "documentation": "https://github.com/maxidrom2008/music-assistant-vk-edition",
   "multi_instance": false
 }

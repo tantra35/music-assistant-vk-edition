@@ -144,7 +144,7 @@ Music Assistant управляет отображением каталога, о
 - Dockerfile: `music_assistant_vk/Dockerfile`.
 - CI: `.github/workflows/build-addon.yml`.
 - Базовый образ: `ghcr.io/music-assistant/server:2.10.9`.
-- Зависимость VK API: `vkpymusic==4.0.2`; запросы авторизации выполняются через её async transport, без стандартного Selenium CAPTCHA handler.
+- Библиотека VK API: пропатченный форк `vkpymusic` 4.0.2 вендорится в `provider/vk_music/vendor/vkpymusic/` (импортируется как подпакет, PyPI не нужен); из зависимостей ставятся только `curl-cffi`, `cryptography` и `aiofiles` — Selenium/PyAV не требуются (их импорты в форке сделаны ленивыми). Запросы авторизации выполняются через её async transport, без стандартного Selenium CAPTCHA handler.
 - Setup flow ориентируется на `validation_type` ответа VK и не задаёт `force_sms=1`.
 - Workflow читает версию из `music_assistant_vk/config.yaml` и публикует образ с соответствующим тегом в GHCR.
 - Текущая сборка рассчитана на `linux/amd64`.

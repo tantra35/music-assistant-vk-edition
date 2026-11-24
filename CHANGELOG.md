@@ -1,5 +1,11 @@
 # Журнал изменений — Music Assistant VK Edition
 
+## 0.2.8 — 24 ноября 2026
+
+- Пропатченный форк `vkpymusic` (VK ID OAuth2, `catalog.*`, обложки альбомов) вендорится в `provider/vk_music/vendor/vkpymusic/`: свежая установка больше не скачивает библиотеку с PyPI и не зависит от её апстрим-версии.
+- Из зависимостей провайдера убраны `selenium`, `webdriver-manager` и `av` — в форке их импорты сделаны ленивыми, провайдеру они не нужны; в манифесте остались только `curl-cffi`, `cryptography`, `aiofiles`.
+- HAOS Dockerfile больше не ставит `vkpymusic==4.0.2` из PyPI, проверки сборки идут против вендоренного подпакета.
+
 ## 0.2.7 — 10 ноября 2026
 
 - Настройка VK переведена с ручного ввода access token и User-Agent на авторизацию по логину и паролю внутри setup flow Music Assistant.

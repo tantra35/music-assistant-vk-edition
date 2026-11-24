@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.vagrant/
+logs/
+data/
+provider/vk_music/vendor/vkpymusic/config_vk.ini

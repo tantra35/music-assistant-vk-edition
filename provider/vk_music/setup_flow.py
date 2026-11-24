@@ -1,292 +1,146 @@
-"""Interactive VK authorization flow for Music Assistant."""
+"""Interactive VK ID authorization flow for Music Assistant."""
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from music_assistant.models.setup_flow import AbortFlow, SetupFlowError
+from music_assistant.models.setup_flow import SetupFlowError
 from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import ConfigEntryType
-from vkpymusic import Service, VkMobileClient
+
+from .vendor.vkpymusic import Service
+from .vendor.vkpymusic.vk_api import VkApiException, VkApiRequestBuilder, make_request_async
 
 from . import CONF_TOKEN, CONF_USER_AGENT
-from .auth import VKAuthChallenge, VKAuthError, request_vk_token, request_vk_validation
+from .auth import (
+    VKAuthError,
+    build_authorize_url,
+    exchange_auth_code,
+    extract_auth_code,
+    make_pkce,
+)
 
 if TYPE_CHECKING:
     from music_assistant.models.setup_flow import SetupSession
 
+# VK Music Android app surface — the UA that serves the catalog family.
+USER_AGENT = "VKMusicAndroidApp"
 
-_CREDENTIAL_ENTRIES = (
-    ConfigEntry(
-        key="login",
-        type=ConfigEntryType.STRING,
-        label="Телефон или email VK",
-        required=True,
-    ),
-    ConfigEntry(
-        key="password",
+_AUTH_STEP_ID = "auth"
+_REDIRECT_KEY = "redirect"
+
+
+async def _probe_catalog_access(service: Service) -> bool:
+    """Check the token actually opens catalog.getAudio.
+
+    Legacy oauth.vk.com tokens validate fine against audio methods but are
+    denied the whole catalog family — reject them here with a clear error.
+    """
+    request = VkApiRequestBuilder.build_req_get_catalog_audio(need_blocks=0)
+    service.fill_user_agent_and_token(request)
+    try:
+        response = await make_request_async(request)
+    except VkApiException:
+        return False
+    data = response.data
+    return isinstance(data, dict) and "catalog" in data
+
+
+def _build_auth_form(auth_url: str) -> list[ConfigEntry]:
+    """The single form: a clickable login link plus the paste-back field.
+
+    LABEL entries render through the frontend's MarkdownText (links are real
+    <a href>), which is the closest a 2.10.9 setup form gets to an Open
+    button — session.external() cannot complete because VK never calls back.
+    """
+    instructions = (
+        f"[**Открыть страницу входа VK ID**]({auth_url})\n\n"
+        "1. Войдите как обычно (пароль, код из MAX и т.п.).\n"
+        "2. После входа браузер окажется на странице "
+        "`api.vk.ru/blank.html#payload=...` — она может выглядеть пустой.\n"
+        "3. Скопируйте ПОЛНЫЙ адрес из адресной строки.\n"
+        "4. Вставьте его в поле ниже.\n\n"
+        "Альтернатива: если у вас уже есть catalog-токен VK ID "
+        "(например, из vkpymusic/config_vk.ini), вставьте его вместо адреса."
+    )
+    link_entry = ConfigEntry(
+        key="auth_link",
+        type=ConfigEntryType.LABEL,
+        # NOTE: the pinned frontend renders LABEL entries from `label`
+        # (displayLabel() = label ?? key) — default_value is never shown.
+        label=instructions,
+        required=False,
+    )
+    redirect_entry = ConfigEntry(
+        key=_REDIRECT_KEY,
         type=ConfigEntryType.SECURE_STRING,
-        label="Пароль VK",
+        label=(
+            "Шаг 2. Адрес после входа — api.vk.ru/blank.html#payload=... "
+            "(или готовый vk1... токен)"
+        ),
         required=True,
-    ),
-)
-
-
-class _InvalidCredentials(Exception):
-    """VK rejected the supplied login or password."""
-
-
-class _RateLimited(Exception):
-    """VK temporarily blocked further login attempts."""
-
-
-class _BrowserCaptchaRequired(Exception):
-    """VK returned its browser-based CAPTCHA flow."""
-
-
-def _validation_mode(validation_type: str) -> str:
-    """Classify the challenge without assuming a specific delivery channel."""
-    value = validation_type.casefold()
-    if any(part in value for part in ("push", "max", "approve", "confirm", "message")):
-        return "approval_or_code"
-    return "code"
-
-
-async def _prompt_validation(
-    session: SetupSession,
-    details: dict[str, Any],
-    *,
-    errors: dict[str, str] | None = None,
-) -> tuple[str | None, bool]:
-    """Ask for a code, or allow a code/push-style approval for unknown methods."""
-    validation_type = str(details.get("validation_type") or "")
-    phone_mask = str(details.get("phone_mask") or "").strip()
-
-    if validation_type == "2fa_sms":
-        label = "Код из SMS"
-        description = f"VK отправил код на {phone_mask}." if phone_mask else "Введите код, который отправил VK."
-    elif validation_type == "2fa_callreset":
-        label = "Последние 4 цифры входящего звонка"
-        description = "Введите последние четыре цифры номера входящего звонка от VK."
-    elif validation_type == "2fa_app":
-        label = "Код из приложения VK"
-        description = "Введите одноразовый код из приложения-аутентификатора VK."
-    else:
-        label = "Код подтверждения"
-        description = (
-            f"VK выбрал способ подтверждения «{validation_type}». "
-            "Введите присланный код или подтвердите вход в приложении и отметьте это ниже."
-            if validation_type
-            else "Введите код VK или подтвердите вход в приложении."
-        )
-
-    mode = _validation_mode(validation_type)
-    entries = [
-        ConfigEntry(
-            key="code",
-            type=ConfigEntryType.SECURE_STRING,
-            label=label,
-            description=description,
-            required=mode == "code",
-        )
-    ]
-    if mode == "approval_or_code":
-        entries.append(
-            ConfigEntry(
-                key="approved",
-                type=ConfigEntryType.BOOLEAN,
-                label="Я подтвердил вход в VK или MAX",
-                description="Отметьте после подтверждения запроса на другом устройстве.",
-                default_value=False,
-                required=False,
-            )
-        )
-
-    current_errors = errors
-    while True:
-        values = await session.form(
-            entries,
-            step_id="verification",
-            errors=current_errors,
-            last_step=False,
-        )
-        code = str(values.get("code") or "").strip() or None
-        approved = bool(values.get("approved", False))
-        if mode == "code" or code or approved:
-            return code, approved
-        current_errors = {
-            "base": "Введите код или подтвердите вход в приложении."
-        }
-
-
-async def _authenticate(session: SetupSession, login: str, password: str) -> str:
-    """Drive VK's challenge/response loop until a token is issued."""
-    code: str | None = None
-    captcha_sid: str | None = None
-    captcha_answer: str | None = None
-    pending_validation: dict[str, Any] | None = None
-    requested_validation_sid: str | None = None
-
-    while True:
-        try:
-            return await request_vk_token(
-                login,
-                password,
-                code=code,
-                captcha_sid=captcha_sid,
-                captcha_answer=captcha_answer,
-            )
-        except VKAuthChallenge as challenge:
-            details = challenge.details
-            error = str(details.get("error") or "")
-            error_type = str(details.get("error_type") or "")
-
-            # A challenge response consumes the submitted code/captcha answer.
-            code = None
-            captcha_sid = None
-            captcha_answer = None
-
-            if error == "invalid_client":
-                raise _InvalidCredentials from challenge
-            if error == "9;Flood control" or error_type == "password_bruteforce_attempt":
-                raise _RateLimited from challenge
-
-            if error == "need_validation":
-                validation_type = str(details.get("validation_type") or "")
-                sid = str(details.get("validation_sid") or "")
-                pending_validation = details
-
-                # Match TokenReceiver's behavior: ask VK to start the
-                # challenge for every validation_sid, regardless of channel.
-                if sid and sid != requested_validation_sid:
-                    await request_vk_validation(sid)
-                    requested_validation_sid = sid
-
-                code, _approved = await _prompt_validation(session, details)
-                continue
-
-            if error == "invalid_request" and pending_validation is not None:
-                validation_type = str(pending_validation.get("validation_type") or "")
-                validation_errors = (
-                    {"base": "VK пока не подтвердил вход или отклонил код. Проверьте приложение и попробуйте ещё раз."}
-                    if _validation_mode(validation_type) == "approval_or_code"
-                    else {"code": "VK не принял код. Проверьте его и попробуйте ещё раз."}
-                )
-                code, _approved = await _prompt_validation(
-                    session,
-                    pending_validation,
-                    errors=validation_errors,
-                )
-                continue
-
-            if error == "need_captcha":
-                captcha_sid_value = details.get("captcha_sid")
-                captcha_img = details.get("captcha_img")
-                if captcha_sid_value and captcha_img:
-                    captcha_entries = [
-                        ConfigEntry(
-                            key="captcha_image",
-                            type=ConfigEntryType.IMAGE,
-                            label="Капча VK",
-                            default_value=str(captcha_img),
-                            required=False,
-                        ),
-                        ConfigEntry(
-                            key="captcha_answer",
-                            type=ConfigEntryType.STRING,
-                            label="Ответ на капчу",
-                            required=True,
-                        ),
-                    ]
-                    values = await session.form(
-                        captcha_entries,
-                        step_id="captcha",
-                        last_step=False,
-                    )
-                    captcha_sid = str(captcha_sid_value)
-                    captcha_answer = str(values.get("captcha_answer") or "").strip()
-                    continue
-
-                # New VK ID CAPTCHA returns redirect_uri and expects a
-                # browser-generated success_token. It is not a text CAPTCHA.
-                raise _BrowserCaptchaRequired from challenge
-
-            raise VKAuthError(
-                f"VK returned an unsupported authorization response: {error or error_type or 'unknown'}"
-            ) from challenge
+    )
+    return [link_entry, redirect_entry]
 
 
 async def run_setup(session: SetupSession) -> None:
-    """Collect temporary credentials, complete VK challenges, and save only the token."""
+    """Drive the VK ID OAuth2 login and save only the resulting token."""
     errors: dict[str, str] | None = None
+    # PKCE verifier is generated here and never leaves the host; only its
+    # challenge is embedded into the login URL.
+    code_verifier, code_challenge = make_pkce()
+    auth_url = build_authorize_url(code_challenge)
 
     while True:
         values = await session.form(
-            list(_CREDENTIAL_ENTRIES),
-            step_id="credentials",
+            _build_auth_form(auth_url),
+            step_id=_AUTH_STEP_ID,
             errors=errors,
             last_step=False,
         )
-        login = str(values.get("login") or "").strip()
-        password = str(values.get("password") or "")
+        errors = None
+        pasted = str(values.get(_REDIRECT_KEY) or "").strip()
 
         try:
-            if not login or not password:
-                errors = {"base": "Введите логин и пароль VK."}
-                continue
-
-            user_agent = VkMobileClient.user_agent
-            try:
-                token = await _authenticate(session, login, password)
-            except _InvalidCredentials:
-                errors = {"base": "VK не принял логин или пароль. Проверьте данные и попробуйте ещё раз."}
-                continue
-            except _RateLimited as err:
-                raise AbortFlow("rate_limited") from err
-            except _BrowserCaptchaRequired:
-                # VK ID CAPTCHA needs a browser-generated success_token. Do not
-                # launch Selenium on the HA host; retain a manual-token fallback.
-                fallback = await session.form(
-                    [
-                        ConfigEntry(
-                            key="manual_token",
-                            type=ConfigEntryType.SECURE_STRING,
-                            label="VK access token",
-                            required=True,
-                        ),
-                        ConfigEntry(
-                            key="manual_user_agent",
-                            type=ConfigEntryType.STRING,
-                            label="VK User-Agent",
-                            default_value=VkMobileClient.user_agent,
-                            required=True,
-                        ),
-                    ],
-                    step_id="token_fallback",
-                    last_step=True,
+            if pasted.startswith("vk1"):
+                # A ready catalog-capable token pasted directly.
+                token = pasted
+            else:
+                code, device_id, redirect_base = extract_auth_code(pasted)
+                data = await exchange_auth_code(
+                    code, code_verifier, device_id, redirect_base
                 )
-                token = str(fallback.get("manual_token") or "").strip()
-                user_agent = str(
-                    fallback.get("manual_user_agent") or VkMobileClient.user_agent
-                ).strip()
-            except VKAuthError as err:
-                raise AbortFlow("auth_failed") from err
+                token = str(data["access_token"])
+        except VKAuthError as err:
+            errors = {"base": str(err)}
+            continue
 
-            service = Service(user_agent=user_agent, token=token)
-            if not await service.is_token_valid_async():
-                raise AbortFlow("token_validation_failed")
+        service = Service(user_agent=USER_AGENT, token=token)
+        try:
+            token_valid = await service.is_token_valid_async()
+        except Exception:
+            token_valid = False
+        if not token_valid:
+            errors = {"base": "VK не принял этот токен. Проверьте и вставьте заново."}
+            continue
 
-            try:
-                # Password and login are deliberately excluded from setup_data.
-                await session.finish(
-                    {
-                        CONF_TOKEN: token,
-                        CONF_USER_AGENT: user_agent,
-                    }
+        if not await _probe_catalog_access(service):
+            errors = {
+                "base": (
+                    "Токен получен, но каталог VK (catalog.getAudio) им не "
+                    "открывается — это устаревший тип токена. Пройдите вход "
+                    "по ссылке заново."
                 )
-                return
-            except SetupFlowError as err:
-                errors = {"base": str(err)}
-        finally:
-            # These values are short-lived inputs; only the access token and
-            # client User-Agent are persisted by session.finish().
-            password = ""
+            }
+            continue
+
+        try:
+            # Only the access token and client User-Agent are persisted.
+            await session.finish(
+                {
+                    CONF_TOKEN: token,
+                    CONF_USER_AGENT: USER_AGENT,
+                }
+            )
+            return
+        except SetupFlowError as err:
+            errors = {"base": str(err)}

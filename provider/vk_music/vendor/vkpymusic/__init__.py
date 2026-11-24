@@ -1,0 +1,45 @@
+"""
+VKpyMusic
+=========
+A library for interacting with music in VK.
+
+Provides a convenient API for authorization, 
+receiving audio recordings, searching for music,
+as well as downloading individual songs and 
+playlists of the user in VK.
+
+Classes:
+    Client: A class that stores the user agent string, client ID, and client secret.
+    TokenReceiver: A class for receiving an access token.
+    Service: A class for interacting with VK API.
+
+Modules:
+    models: A module that contains all models for vkpymusic.
+    utils: A module that contains utilities for conversion and logging.
+    vk_api: A module that contains classes for requests to VK API.
+"""
+
+__title__ = "vkpymusic"
+__author__ = "issamansur"
+__license__ = "MIT"
+__copyright__ = "Copyright 2023-present issamansur (EDEXADE, Inc)"
+__version__ = "4.0.2"
+
+from .client import Client, KateMobileClient, VkMobileClient
+from .token_receiver import TokenReceiver
+from .vk_id_receiver import VkIdReceiver
+from .service import Service
+
+from . import vk_api, models, utils
+
+__all__ = [
+    "Client",
+    "KateMobileClient",
+    "VkMobileClient",
+    "TokenReceiver",
+    "VkIdReceiver",
+    "Service",
+    "vk_api",
+    "models",
+    "utils",
+]
