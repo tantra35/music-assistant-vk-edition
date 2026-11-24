@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from typing import TYPE_CHECKING
 
 from music_assistant.models.music_provider import MusicProvider
@@ -96,12 +97,13 @@ class VKMusicProvider(MusicProvider):
         # podcast owner_id -> raw show dict, refreshed on each browse of a
         # section containing podcasts blocks
         self._podcast_cache: dict[str, dict] = {}
-        # podcast episode item_id -> fresh signed stream url (audio.getById
-        # does not serve podcast episodes on this token surface)
-        self._episode_cache: dict[str, str] = {}
-        # chapter item_id -> (stream url, duration); urls are signed and expire,
-        # so they are refreshed whenever the owning digest is re-browsed
-        self._chapter_cache: dict[str, tuple[str, int, str]] = {}
+        # podcast episode item_id -> (fresh signed stream url, fetched_at)
+        # (audio.getById does not serve podcast episodes on this surface)
+        self._episode_cache: dict[str, tuple[str, float]] = {}
+        # chapter item_id -> (stream url, duration, title, fetched_at);
+        # urls are signed and expire, so get_stream_details refreshes stale
+        # entries before playback
+        self._chapter_cache: dict[str, tuple[str, int, str, float]] = {}
         try:
             valid = await self._service.is_token_valid_async()
         except Exception as err:
@@ -372,6 +374,8 @@ class VKMusicProvider(MusicProvider):
                 )
         return results
 
+    _STREAM_URL_TTL = 6 * 3600  # VK signed urls live well beyond this
+
     async def get_track(self, prov_track_id: str) -> Track:
         """Retrieve current metadata for a VK track."""
         if prov_track_id.startswith("abch:"):
@@ -385,7 +389,7 @@ class VKMusicProvider(MusicProvider):
                 cached = self._chapter_cache.get(prov_track_id)
             if cached is None:
                 raise MediaNotFoundError(f"VK audiobook chapter not found: {prov_track_id}")
-            url, duration, title = cached
+            _url, duration, title = cached[:3]
             return Track(
                 item_id=prov_track_id,
                 provider=self.instance_id,
@@ -393,10 +397,10 @@ class VKMusicProvider(MusicProvider):
                 duration=duration,
                 provider_mappings=self._mapping(prov_track_id),
             )
-        if prov_track_id in self._episode_cache:
+        cached_episode = self._episode_cache.get(prov_track_id)
+        if cached_episode is not None:
             # podcast episode: audio.getById does not serve episodes on this
             # token surface — rebuild metadata from the cached stream url
-            url = self._episode_cache[prov_track_id]
             return Track(
                 item_id=prov_track_id,
                 provider=self.instance_id,
@@ -693,7 +697,10 @@ class VKMusicProvider(MusicProvider):
             if raw.get("url") and raw.get("owner_id") and raw.get("id"):
                 # podcast episodes are not served by audio.getById on this
                 # token surface: keep the fresh signed url for playback
-                self._episode_cache[f"{raw['owner_id']}_{raw['id']}"] = str(raw["url"])
+                self._episode_cache[f"{raw['owner_id']}_{raw['id']}"] = (
+                    str(raw["url"]),
+                    time.time(),
+                )
         return self._parse_raw_audios(raw_items)
 
     def _render_book_chapters(self, book: dict) -> list[Track]:
@@ -708,7 +715,12 @@ class VKMusicProvider(MusicProvider):
                 continue
             item_id = f"abch:{book_id}:{chapter.get('id')}"
             duration = max(0, int(audio_file.get("duration") or 0))
-            self._chapter_cache[item_id] = (str(url), duration, f"{index}. {title}")
+            self._chapter_cache[item_id] = (
+                str(url),
+                duration,
+                f"{index}. {title}",
+                time.time(),
+            )
             items.append(
                 Track(
                     item_id=item_id,
@@ -958,11 +970,19 @@ class VKMusicProvider(MusicProvider):
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Resolve a fresh stream URL immediately before playback."""
         try:
-            if item_id in self._episode_cache:
+            cached_episode = self._episode_cache.get(item_id)
+            if (
+                cached_episode is not None
+                and time.time() - cached_episode[1] > self._STREAM_URL_TTL
+            ):
+                # signed url expired: re-fetch the show's episodes
+                await self._browse_podcast_episodes(item_id.partition("_")[0])
+                cached_episode = self._episode_cache.get(item_id)
+            if cached_episode is not None:
                 # podcast episode: audio.getById does not serve episodes on
                 # this token surface; reuse the url from podcasts.getEpisodes.
                 # Episode urls (/s/v1/ac/) 302-redirect to an HLS playlist.
-                url = self._episode_cache[item_id]
+                url = cached_episode[0]
                 is_hls = "/s/v1/ac/" in url or "m3u8" in url
                 content_type = ContentType.try_parse(url.split("?", 1)[0]) or (
                     ContentType.AAC if is_hls else ContentType.MP3
@@ -979,10 +999,10 @@ class VKMusicProvider(MusicProvider):
                 )
             if item_id.startswith("abch:"):
                 # audiobook chapter: the signed stream url was cached when the
-                # chapter list was browsed; refresh the book on a cache miss
-                # (e.g. a queue persisted before a provider restart)
+                # chapter list was browsed; refresh the book on a cache miss or
+                # an expired signed url (e.g. a queue persisted before restart)
                 cached = self._chapter_cache.get(item_id)
-                if cached is None:
+                if cached is None or time.time() - cached[3] > self._STREAM_URL_TTL:
                     book = await self._refresh_book(item_id.split(":")[1])
                     if book:
                         self._render_book_chapters(book)
@@ -991,7 +1011,7 @@ class VKMusicProvider(MusicProvider):
                     raise MediaNotFoundError(
                         f"VK audiobook chapter stream expired, re-open the book: {item_id}"
                     )
-                url, duration, _title = cached
+                url = cached[0]
                 content_type = ContentType.try_parse(url.split("?", 1)[0]) or ContentType.MP3
                 return StreamDetails(
                     provider=self.instance_id,
@@ -1013,6 +1033,27 @@ class VKMusicProvider(MusicProvider):
                     raise LoginFailed("VK denied access to this audio; check account entitlement") from err
                 raise
             if not songs or not songs[0].url:
+                if owner.startswith("-"):
+                    # community audio that fails audio.getById may be a podcast
+                    # episode — self-heal via podcasts.getEpisodes once
+                    await self._browse_podcast_episodes(owner)
+                    episode_url = self._episode_cache.get(item_id)
+                    if episode_url:
+                        url = episode_url[0]
+                        is_hls = "/s/v1/ac/" in url or "m3u8" in url
+                        content_type = ContentType.try_parse(
+                            url.split("?", 1)[0]
+                        ) or (ContentType.AAC if is_hls else ContentType.MP3)
+                        return StreamDetails(
+                            provider=self.instance_id,
+                            item_id=item_id,
+                            media_type=MediaType.TRACK,
+                            audio_format=AudioFormat(content_type=content_type),
+                            stream_type=StreamType.HLS if is_hls else StreamType.HTTP,
+                            path=url,
+                            can_seek=is_hls,
+                            allow_seek=is_hls,
+                        )
                 raise MediaNotFoundError(f"VK did not provide an accessible stream for {item_id}")
             url = songs[0].url
             content_type = ContentType.try_parse(url.split("?", 1)[0])
